@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+const { useState, useEffect, useRef, useCallback } = React;
 
 /*
  * SUPPLY CHAIN INTELLIGENCE v3.0
@@ -18,7 +18,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 // ⚠️  BEFORE DEPLOYING: replace "" with your Render backend URL
 //     e.g.  const API_BASE = "https://supply-chain-v3.onrender.com";
 //     Leave as "" only for local dev (backend on localhost:8000).
-const API_BASE = "";
+const API_BASE = "https://supply-chain-api-knkv.onrender.com";
 
 // ─── STATIC DATA (mirrors backend SyntheticDataConnector) ─────
 const WH = [
@@ -824,7 +824,7 @@ function ScenarioPlanner({ onResult }) {
 // ═══════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════
-export default function App() {
+function App() {
   const [baseline, setBaseline] = useState(() => solveGreedy());
   const [scenario, setScenario] = useState(null);
   const [activeTab, setActiveTab] = useState("map");
@@ -1257,3 +1257,7 @@ export default function App() {
     </div>
   );
 }
+
+// Mount app
+const _root = ReactDOM.createRoot(document.getElementById("root"));
+_root.render(React.createElement(App));
