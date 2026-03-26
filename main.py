@@ -1114,6 +1114,28 @@ def get_v3_status():
     }
 
 
+@app.get("/api/v3/test-serper")
+def test_serper_connection():
+    """Debug endpoint — tests Serper connectivity and returns raw response."""
+    if not SERPER_API_KEY:
+        return {"configured": False, "error": "SERPER_API_KEY not set"}
+    try:
+        r = requests.post(
+            "https://google.serper.dev/news",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": "Singapore port disruption", "num": 2, "gl": "us"},
+            timeout=10,
+        )
+        return {
+            "configured": True,
+            "status_code": r.status_code,
+            "response_preview": str(r.text)[:500],
+            "key_prefix": SERPER_API_KEY[:8] + "...",
+        }
+    except Exception as e:
+        return {"configured": True, "error": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
