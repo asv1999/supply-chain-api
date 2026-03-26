@@ -18,6 +18,8 @@ NEW in v3.0:
 import os, json, re, math, time, uuid, sqlite3, random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,13 +50,18 @@ except ImportError:
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 SERPER_API_KEY  = os.environ.get("SERPER_API_KEY", "")          # serper.dev — 2500 free/mo
-HF_API_TOKEN    = os.environ.get("HF_API_TOKEN", "")            # HuggingFace (unchanged)
+GNEWS_API_KEY   = os.environ.get("GNEWS_API_KEY", "")
+NEWSAPI_API_KEY = os.environ.get("NEWSAPI_API_KEY", "")
+INTEL_PROVIDER  = os.environ.get("INTEL_PROVIDER", "auto").strip().lower() or "auto"
+HF_API_TOKEN    = os.environ.get("HF_API_TOKEN", os.environ.get("HUGGINGFACE_API_KEY", ""))
 LLAMA_MODEL     = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 FALLBACK_MODEL  = "mistralai/Mistral-7B-Instruct-v0.3"
 HF_API_URL      = f"https://api-inference.huggingface.co/models/{LLAMA_MODEL}"
 HF_FALLBACK_URL = f"https://api-inference.huggingface.co/models/{FALLBACK_MODEL}"
 DB_PATH         = os.environ.get("SQLITE_DB_PATH", "sc_intelligence.db")
 INTEL_REFRESH_H = int(os.environ.get("INTEL_REFRESH_HOURS", "3"))
+INTEL_TTL_H     = int(os.environ.get("INTEL_TTL_HOURS", "6"))
+SERPER_BASE_URL = os.environ.get("SERPER_BASE_URL", "https://google.serper.dev")
 
 app = FastAPI(
     title="Supply Chain Intelligence API v3.0",
@@ -240,36 +247,204 @@ STATIC_INTEL_FALLBACK = [
     {"hub_id":"WH-CLT","title":"Southeast US Corridor Performing Above Average","snippet":"Charlotte and Atlanta DCs reporting above-baseline throughput; no significant disruptions on Eastern Seaboard.","source":"DC Velocity","category":"General","riskScore":0.15,"date":"Live feed unavailable — configure SERPER_API_KEY"},
 ]
 
+LAST_INTEL_META = {
+    "provider": "static",
+    "mode": "static",
+    "refreshedAt": None,
+    "details": {},
+}
+
+def _normalize_news_item(hub_id: str, title: str, snippet: str, source: str = "",
+                         link: str = "", date: str = "", provider: str = "") -> Optional[Dict]:
+    title = (title or "").strip()
+    snippet = re.sub(r"<[^>]+>", " ", (snippet or "")).strip()
+    source = (source or provider or "").strip()
+    if not title:
+        return None
+    cat, score = classify_and_score(f"{title} {snippet}")
+    if score < 0.3:
+        return None
+    return {
+        "hub_id": hub_id,
+        "title": title[:120],
+        "snippet": snippet[:240],
+        "source": source[:80],
+        "link": link or "",
+        "date": (date or "")[:40],
+        "category": cat,
+        "riskScore": score,
+        "provider": provider or "unknown",
+    }
+
+def _dedupe_news_items(items: List[Dict]) -> List[Dict]:
+    seen = set()
+    deduped = []
+    for item in sorted(items, key=lambda x: x.get("riskScore", 0), reverse=True):
+        key = (
+            item.get("hub_id", ""),
+            re.sub(r"\W+", "", item.get("title", "").lower()),
+            item.get("link", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+def _configured_provider_order() -> List[str]:
+    if INTEL_PROVIDER in {"serper", "gnews", "newsapi", "rss", "static"}:
+        return [INTEL_PROVIDER]
+    return ["serper", "gnews", "newsapi", "rss", "static"]
+
 def _fetch_serper(hub_id: str, queries: List[str]) -> List[Dict]:
     if not SERPER_API_KEY:
         return []
     results = []
-    for q in queries[:2]:  # 2 queries/hub × 8 hubs = 16 searches per refresh
+    for q in queries[:2]:
         try:
             r = requests.post(
-                "https://google.serper.dev/news",
+                f"{SERPER_BASE_URL.rstrip('/')}/news",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": q, "num": 4, "gl": "us"},
+                json={"q": q, "num": 4, "gl": "us", "hl": "en"},
                 timeout=10,
             )
             if r.status_code == 200:
                 for item in r.json().get("news", []):
-                    cat, score = classify_and_score(item.get("title","") + " " + item.get("snippet",""))
-                    if score >= 0.3:
-                        results.append({
-                            "hub_id": hub_id,
-                            "title":   item.get("title","")[:120],
-                            "snippet": item.get("snippet","")[:240],
-                            "source":  item.get("source",""),
-                            "link":    item.get("link",""),
-                            "date":    item.get("date",""),
-                            "category": cat,
-                            "riskScore": score,
-                        })
+                    normalized = _normalize_news_item(
+                        hub_id=hub_id,
+                        title=item.get("title", ""),
+                        snippet=item.get("snippet", ""),
+                        source=item.get("source", "Serper"),
+                        link=item.get("link", ""),
+                        date=item.get("date", ""),
+                        provider="serper",
+                    )
+                    if normalized:
+                        results.append(normalized)
+            else:
+                preview = r.text[:180].replace("\n", " ")
+                print(f"[Serper] {hub_id} status={r.status_code} body={preview}")
         except Exception as e:
             print(f"[Serper] Error for {hub_id}: {e}")
         time.sleep(0.3)
-    return results
+    return _dedupe_news_items(results)
+
+def _fetch_gnews(hub_id: str, queries: List[str]) -> List[Dict]:
+    if not GNEWS_API_KEY:
+        return []
+    results = []
+    for q in queries[:2]:
+        try:
+            r = requests.get(
+                "https://gnews.io/api/v4/search",
+                params={"q": q, "lang": "en", "country": "us", "max": 5, "apikey": GNEWS_API_KEY},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                for item in r.json().get("articles", []):
+                    src = (item.get("source") or {}).get("name", "GNews")
+                    normalized = _normalize_news_item(
+                        hub_id=hub_id,
+                        title=item.get("title", ""),
+                        snippet=item.get("description", "") or item.get("content", ""),
+                        source=src,
+                        link=item.get("url", ""),
+                        date=item.get("publishedAt", ""),
+                        provider="gnews",
+                    )
+                    if normalized:
+                        results.append(normalized)
+            else:
+                print(f"[GNews] {hub_id} status={r.status_code}")
+        except Exception as e:
+            print(f"[GNews] Error for {hub_id}: {e}")
+        time.sleep(0.2)
+    return _dedupe_news_items(results)
+
+def _fetch_newsapi(hub_id: str, queries: List[str]) -> List[Dict]:
+    if not NEWSAPI_API_KEY:
+        return []
+    results = []
+    for q in queries[:2]:
+        try:
+            r = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "q": q,
+                    "language": "en",
+                    "pageSize": 5,
+                    "sortBy": "publishedAt",
+                    "apiKey": NEWSAPI_API_KEY,
+                },
+                timeout=10,
+            )
+            if r.status_code == 200:
+                for item in r.json().get("articles", []):
+                    src = (item.get("source") or {}).get("name", "NewsAPI")
+                    normalized = _normalize_news_item(
+                        hub_id=hub_id,
+                        title=item.get("title", ""),
+                        snippet=item.get("description", "") or item.get("content", ""),
+                        source=src,
+                        link=item.get("url", ""),
+                        date=item.get("publishedAt", ""),
+                        provider="newsapi",
+                    )
+                    if normalized:
+                        results.append(normalized)
+            else:
+                print(f"[NewsAPI] {hub_id} status={r.status_code}")
+        except Exception as e:
+            print(f"[NewsAPI] Error for {hub_id}: {e}")
+        time.sleep(0.2)
+    return _dedupe_news_items(results)
+
+def _fetch_google_news_rss(hub_id: str, queries: List[str]) -> List[Dict]:
+    results = []
+    for q in queries[:2]:
+        try:
+            rss_q = quote_plus(f"{q} when:7d")
+            r = requests.get(
+                f"https://news.google.com/rss/search?q={rss_q}&hl=en-US&gl=US&ceid=US:en",
+                timeout=10,
+            )
+            if r.status_code != 200:
+                print(f"[RSS] {hub_id} status={r.status_code}")
+                continue
+            root = ET.fromstring(r.text)
+            for item in root.findall(".//item")[:5]:
+                source_el = item.find("source")
+                normalized = _normalize_news_item(
+                    hub_id=hub_id,
+                    title=item.findtext("title", default=""),
+                    snippet=item.findtext("description", default=""),
+                    source=source_el.text if source_el is not None else "Google News RSS",
+                    link=item.findtext("link", default=""),
+                    date=item.findtext("pubDate", default=""),
+                    provider="rss",
+                )
+                if normalized:
+                    results.append(normalized)
+        except Exception as e:
+            print(f"[RSS] Error for {hub_id}: {e}")
+        time.sleep(0.15)
+    return _dedupe_news_items(results)
+
+def _fetch_hub_intelligence(hub_id: str, queries: List[str]) -> Dict[str, Any]:
+    for provider in _configured_provider_order():
+        if provider == "serper":
+            items = _fetch_serper(hub_id, queries)
+        elif provider == "gnews":
+            items = _fetch_gnews(hub_id, queries)
+        elif provider == "newsapi":
+            items = _fetch_newsapi(hub_id, queries)
+        elif provider == "rss":
+            items = _fetch_google_news_rss(hub_id, queries)
+        else:
+            items = [dict(item, provider="static") for item in STATIC_INTEL_FALLBACK if item["hub_id"] == hub_id]
+        if items:
+            return {"provider": provider, "items": _dedupe_news_items(items)}
+    return {"provider": "static", "items": []}
 
 def _cache_intel(hub_id: str, items: List[Dict]):
     conn = sqlite3.connect(DB_PATH)
@@ -293,19 +468,50 @@ def _read_intel_cache(max_age_h: int = 6) -> List[Dict]:
               "category":r[5],"riskScore":r[6],"date":r[7][:10]} for r in rows]
 
 def refresh_intelligence():
-    """Background job: pull fresh Serper intelligence for all hubs."""
+    """Background job: pull fresh disruption intelligence for all hubs."""
+    global LAST_INTEL_META
     print(f"[Intel] Refresh at {datetime.utcnow().isoformat()}")
+    provider_counts = {}
+    total_items = 0
     for hub_id, queries in HUB_QUERIES.items():
-        items = _fetch_serper(hub_id, queries)
+        result = _fetch_hub_intelligence(hub_id, queries)
+        items = result["items"]
         if items:
             _cache_intel(hub_id, items)
+            provider = result["provider"]
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
+            total_items += len(items)
+    primary_provider = max(provider_counts, key=provider_counts.get) if provider_counts else "static"
+    LAST_INTEL_META = {
+        "provider": primary_provider,
+        "mode": "live" if primary_provider != "static" else "static",
+        "refreshedAt": datetime.utcnow().isoformat() + "Z",
+        "details": {"providerCounts": provider_counts, "totalItems": total_items},
+    }
     print(f"[Intel] Done")
 
-def get_live_intelligence() -> List[Dict]:
-    cached = _read_intel_cache(max_age_h=6)
+def get_intelligence_snapshot() -> Dict[str, Any]:
+    cached = _read_intel_cache(max_age_h=INTEL_TTL_H)
     if cached:
-        return sorted(cached, key=lambda x: x.get("riskScore", 0), reverse=True)
-    return sorted(STATIC_INTEL_FALLBACK, key=lambda x: x.get("riskScore", 0), reverse=True)
+        provider = LAST_INTEL_META.get("provider", "cache")
+        return {
+            "events": sorted(cached, key=lambda x: x.get("riskScore", 0), reverse=True),
+            "provider": provider,
+            "mode": "live" if provider != "static" else "static",
+            "cacheHit": True,
+            "refreshedAt": LAST_INTEL_META.get("refreshedAt"),
+        }
+    return {
+        "events": sorted([dict(item, provider="static") for item in STATIC_INTEL_FALLBACK],
+                         key=lambda x: x.get("riskScore", 0), reverse=True),
+        "provider": "static",
+        "mode": "static",
+        "cacheHit": False,
+        "refreshedAt": None,
+    }
+
+def get_live_intelligence() -> List[Dict]:
+    return get_intelligence_snapshot()["events"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -934,13 +1140,14 @@ def root():
             "solver":"PuLP-MIP" if PULP_AVAILABLE else "Greedy",
             "networkx":NX_AVAILABLE,"scheduler":SCHEDULER_AVAILABLE,
             "serper_configured":bool(SERPER_API_KEY),
+            "intel_provider":INTEL_PROVIDER,
             "features":["mip-optimization","live-intelligence","weather","route-optimization","predictions"]}
 
 @app.get("/health")
 def health():
     return {"status":"healthy","version":"3.0.0","llm_configured":bool(HF_API_TOKEN),
             "serper_configured":bool(SERPER_API_KEY),"solver":"PuLP" if PULP_AVAILABLE else "Greedy",
-            "networkx":NX_AVAILABLE}
+            "networkx":NX_AVAILABLE,"intel_provider":INTEL_PROVIDER}
 
 @app.get("/baseline")
 def get_baseline():
@@ -1026,7 +1233,8 @@ def get_intelligence(hub_id: Optional[str] = None):
     Returns scored events per hub with category, risk score, and source attribution.
     Configure SERPER_API_KEY env var to enable live data (serper.dev — 2500 free/mo).
     """
-    events = get_live_intelligence()
+    snapshot = get_intelligence_snapshot()
+    events = snapshot["events"]
     if hub_id:
         events = [e for e in events if e.get("hub_id") == hub_id]
     hub_scores = compute_hub_scores(events, [])
@@ -1035,9 +1243,39 @@ def get_intelligence(hub_id: Optional[str] = None):
         "hubScores": hub_scores,
         "totalEvents": len(events),
         "highRiskCount": sum(1 for e in events if e.get("riskScore",0) > 0.6),
-        "liveDataActive": bool(SERPER_API_KEY),
+        "provider": snapshot["provider"],
+        "mode": snapshot["mode"],
+        "cacheHit": snapshot["cacheHit"],
+        "liveDataActive": snapshot["mode"] == "live",
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
+
+@app.get("/api/v3/test-serper")
+def test_serper():
+    if not SERPER_API_KEY:
+        return {"configured": False, "status_code": None, "response_preview": "", "key_prefix": ""}
+    try:
+        r = requests.post(
+            f"{SERPER_BASE_URL.rstrip('/')}/news",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": "global supply chain disruption", "num": 1, "gl": "us", "hl": "en"},
+            timeout=10,
+        )
+        return {
+            "configured": True,
+            "status_code": r.status_code,
+            "response_preview": r.text[:300],
+            "key_prefix": f"{SERPER_API_KEY[:8]}..." if SERPER_API_KEY else "",
+            "base_url": SERPER_BASE_URL,
+        }
+    except Exception as e:
+        return {
+            "configured": True,
+            "status_code": None,
+            "response_preview": str(e),
+            "key_prefix": f"{SERPER_API_KEY[:8]}..." if SERPER_API_KEY else "",
+            "base_url": SERPER_BASE_URL,
+        }
 
 @app.get("/api/v3/weather")
 def get_weather():
@@ -1097,7 +1335,8 @@ async def trigger_refresh(bg: BackgroundTasks):
 @app.get("/api/v3/status")
 def get_v3_status():
     """Full v3 system status — useful for dashboard health widget."""
-    intel   = get_live_intelligence()
+    snapshot = get_intelligence_snapshot()
+    intel   = snapshot["events"]
     weather = get_live_weather()
     scores  = compute_hub_scores(intel, weather)
     return {
@@ -1106,34 +1345,17 @@ def get_v3_status():
         "networkx": NX_AVAILABLE,
         "scheduler": SCHEDULER_AVAILABLE,
         "serper": bool(SERPER_API_KEY),
+        "gnews": bool(GNEWS_API_KEY),
+        "newsapi": bool(NEWSAPI_API_KEY),
+        "intelProviderConfigured": INTEL_PROVIDER,
+        "intelProviderActive": snapshot["provider"],
+        "intelMode": snapshot["mode"],
         "intelEvents": len(intel),
         "weatherHubs": len(weather),
         "highRiskHubs": [k for k,v in scores.items() if v > 0.6],
         "hubScores": scores,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-
-
-@app.get("/api/v3/test-serper")
-def test_serper_connection():
-    """Debug endpoint — tests Serper connectivity and returns raw response."""
-    if not SERPER_API_KEY:
-        return {"configured": False, "error": "SERPER_API_KEY not set"}
-    try:
-        r = requests.post(
-            "https://google.serper.dev/news",
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": "Singapore port disruption", "num": 2, "gl": "us"},
-            timeout=10,
-        )
-        return {
-            "configured": True,
-            "status_code": r.status_code,
-            "response_preview": str(r.text)[:500],
-            "key_prefix": SERPER_API_KEY[:8] + "...",
-        }
-    except Exception as e:
-        return {"configured": True, "error": str(e)}
 
 
 if __name__ == "__main__":
