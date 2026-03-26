@@ -1,4 +1,21 @@
-fastapi==0.115.0
-uvicorn==0.30.0
-requests==2.32.0
-pydantic==2.9.0
+# Supply Chain Intelligence v3 - Backend Requirements
+# =====================================================
+# Core Framework (unchanged from v2)
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+requests==2.31.0
+python-multipart==0.0.6
+
+# v3 NEW: MIP Solver (free Gurobi replacement via CBC)
+pulp==2.7.0
+
+# v3 NEW: Route Optimization Graph Engine
+networkx==3.2.1
+
+# v3 NEW: Background Scheduler (intel 3h refresh, weather 1h refresh)
+apscheduler==3.10.4
+
+# v3 NEW: Numerical predictions (EWMA forecasting)
+# numpy is typically pre-installed; pin for reproducibility
+numpy==1.26.3

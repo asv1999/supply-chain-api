@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: supply-chain-v3
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: HUGGINGFACE_API_KEY
+        sync: false          # set manually in Render dashboard
+      - key: SERPER_API_KEY
+        sync: false          # optional — set when you get your key
